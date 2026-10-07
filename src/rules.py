@@ -1,6 +1,11 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+# 占用账中被视为"救援进行中"的报警状态
+ACTIVE_ALARM_STATUSES = ("received", "dispatched", "resolved")
+RESCUE_PAUSE_STATUSES = ("requested", "issued", "active")
+PERMIT_OCCUPYING_STATUSES = ("issued", "active")
 
 
 def _require(data, fields):
@@ -34,6 +39,21 @@ def _positive(value, field):
     return number
 
 
+def _shaft_of_alarm(alarm, lookup):
+    shaft_id = alarm["data"].get("shaft_id")
+    if shaft_id:
+        return shaft_id
+    equipment = _find_one(lookup, "equipment", "id", alarm["data"].get("equipment_id"))
+    return (equipment or {}).get("data", {}).get("shaft_id") if equipment else None
+
+
+def _active_alarm_for_shaft(lookup, shaft_id):
+    for alarm in _all(lookup, "alarm"):
+        if alarm["status"] in ACTIVE_ALARM_STATUSES and _shaft_of_alarm(alarm, lookup) == shaft_id:
+            return alarm
+    return None
+
+
 def _validate_equipment(data, lookup):
     asset_no = str(data.get("asset_no", "")).strip()
     if not asset_no:
@@ -55,12 +75,20 @@ def _validate_inspection(data, lookup):
 
 
 def _validate_maintenance(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
-        raise ValidationError("maintenance requires equipment")
+    shaft_id = data.get("shaft_id")
+    equipment_id = data.get("equipment_id")
+    if not shaft_id and not equipment_id:
+        raise ValidationError("maintenance requires shaft_id or equipment_id")
+    if equipment_id and not _find_one(lookup, "equipment", "id", equipment_id):
+        raise ValidationError("maintenance references unknown equipment")
+    if shaft_id and not _find_one(lookup, "shaft", "id", shaft_id):
+        raise ValidationError("maintenance requires an existing shaft")
     if data.get("work_type") not in ("routine", "repair", "component_replacement", "modernization"):
         raise ValidationError("invalid work_type")
     if data.get("work_type") == "component_replacement" and not data.get("part_serial"):
         raise ValidationError("part_serial is required for component replacement")
+    if not str(data.get("team", "")).strip():
+        raise ValidationError("team is required")
 
 
 def _validate_alarm(data, lookup):
@@ -101,6 +129,28 @@ def _validate_permit(data, lookup):
         raise ValidationError("invalid permit purpose")
 
 
+def _validate_shaft(data, lookup):
+    shaft_code = str(data.get("shaft_code", "")).strip()
+    if not shaft_code:
+        raise ValidationError("shaft_code is required")
+    if _find_one(lookup, "shaft", "shaft_code", shaft_code):
+        raise ConflictError("shaft_code already exists: " + shaft_code)
+    if not str(data.get("location", "")).strip():
+        raise ValidationError("location is required")
+
+
+def _validate_work_permit(data, lookup):
+    shaft = _find_one(lookup, "shaft", "id", data.get("shaft_id"))
+    if not shaft:
+        raise ValidationError("work_permit requires an existing shaft")
+    if not str(data.get("team", "")).strip():
+        raise ValidationError("team is required")
+    if data.get("work_type") not in ("routine", "repair", "component_replacement", "modernization"):
+        raise ValidationError("invalid work_type")
+    # 申请阶段允许排队；同井道只放一张进场许可的互斥在 issue 时强制
+    # （并由 work_permit(status='issued') 部分唯一索引兜底）。
+
+
 def _grant_permit(actor, entity, data, lookup):
     equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
     if not equipment or equipment["status"] not in ("in_service", "suspended"):
@@ -111,6 +161,24 @@ def _grant_permit(actor, entity, data, lookup):
     if [r for r in _all(lookup, "remediation") if r["data"].get("equipment_id") == equipment["id"] and r["status"] != "closed"]:
         raise ConflictError("permit blocked by open remediation")
     return {"granted_by": actor.user_id, "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+
+
+def _issue_work_permit(actor, entity, data, lookup):
+    shaft_id = entity["data"].get("shaft_id")
+    if _active_alarm_for_shaft(lookup, shaft_id):
+        raise ConflictError("cannot issue work permit while shaft rescue is active")
+    for permit in _all(lookup, "work_permit"):
+        if permit["id"] == entity["id"]:
+            continue
+        if permit["data"].get("shaft_id") == shaft_id and permit["status"] in PERMIT_OCCUPYING_STATUSES:
+            raise ConflictError("shaft already has an active work permit: " + permit["id"])
+    return {"issued_by": actor.user_id, "issued_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+
+
+def _activate_work_permit(actor, entity, data, lookup):
+    if _active_alarm_for_shaft(lookup, entity["data"].get("shaft_id")):
+        raise ConflictError("cannot enter shaft while rescue is active")
+    return {"activated_by": actor.user_id, "activated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
 
 
 def _verify_remediation(actor, entity, data, lookup):
@@ -126,16 +194,49 @@ def _complete_rescue(actor, entity, data, lookup):
     return {"resolved_by": actor.user_id}
 
 
+def _start_maintenance(actor, entity, data, lookup):
+    shaft_id = entity["data"].get("shaft_id")
+    permit = None
+    for candidate in _all(lookup, "work_permit"):
+        if (
+            candidate["data"].get("shaft_id") == shaft_id
+            and candidate["data"].get("team") == entity["data"].get("team")
+            and candidate["status"] in PERMIT_OCCUPYING_STATUSES
+        ):
+            permit = candidate
+            break
+    if not permit:
+        raise ConflictError("maintenance requires a valid issued/active work permit for this shaft and team")
+    if _active_alarm_for_shaft(lookup, shaft_id):
+        raise ConflictError("cannot start maintenance while shaft rescue is active")
+    return {"permit_id": permit["id"], "started_by": actor.user_id, "started_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+
+
+def _resume_maintenance(actor, entity, data, lookup):
+    shaft_id = entity["data"].get("shaft_id")
+    valid_permit = any(
+        permit["data"].get("shaft_id") == shaft_id
+        and permit["data"].get("team") == entity["data"].get("team")
+        and permit["status"] in PERMIT_OCCUPYING_STATUSES
+        for permit in _all(lookup, "work_permit")
+    )
+    if not valid_permit:
+        raise ConflictError("cannot resume maintenance without a valid work permit")
+    if _active_alarm_for_shaft(lookup, shaft_id):
+        raise ConflictError("cannot resume maintenance while shaft rescue is active")
+    return {"resumed_by": actor.user_id, "resumed_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+
+
 class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "shafts": "shaft", "work_permits": "work_permit",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "shaft": "available", "work_permit": "requested",
     }
     TRANSITIONS = {
         "equipment": {
@@ -150,7 +251,11 @@ class RuleEngine:
         },
         "maintenance": {
             "start": (("planned",), "in_progress"),
-            "complete": (("in_progress",), "completed"),
+            "confirm_evacuation": (("in_progress",), "evacuated"),
+            "complete": (("evacuated",), "completed"),
+            "mark_review": (("in_progress",), "review_pending"),
+            "review_evacuated": (("review_pending",), "evacuated"),
+            "review_resume": (("review_pending",), "in_progress"),
         },
         "alarm": {
             "dispatch": (("received",), "dispatched"),
@@ -175,33 +280,49 @@ class RuleEngine:
             "revoke": (("granted", "pending_review"), "revoked"),
             "expire": (("granted",), "expired"),
         },
+        "work_permit": {
+            "issue": (("requested",), "issued"),
+            "activate": (("issued",), "active"),
+            "confirm_evacuation": (("active", "issued"), "evacuated"),
+            "close": (("evacuated", "rescue_stop", "issued", "requested"), "closed"),
+            "void": (("requested", "issued", "active"), "void"),
+        },
     }
     CREATE_REQUIRED = {
         "equipment": ("asset_no", "equipment_type", "location", "inspection_interval_days"),
         "inspection": ("equipment_id", "scheduled_at", "cycle_days"),
-        "maintenance": ("equipment_id", "work_type", "planned_at"),
+        "maintenance": ("work_type", "planned_at", "team"),
         "alarm": ("equipment_id", "code", "occurred_at"),
         "rescue_job": ("alarm_id", "dedupe_key", "team"),
         "remediation": ("issue", "owner", "due_at"),
         "permit": ("equipment_id", "purpose", "requested_by"),
+        "shaft": ("shaft_code", "location"),
+        "work_permit": ("shaft_id", "team", "work_type"),
     }
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
         ("inspection", "fail"): ("findings",),
         ("maintenance", "complete"): ("completed_at",),
+        ("maintenance", "confirm_evacuation"): ("evacuated_by",),
+        ("maintenance", "review_evacuated"): ("reviewed_by",),
+        ("maintenance", "review_resume"): ("reviewed_by",),
         ("rescue_job", "complete"): ("outcome",),
         ("remediation", "submit_evidence"): ("evidence",),
         ("alarm", "resolve"): ("resolution",),
         ("permit", "revoke"): ("reason",),
+        ("work_permit", "confirm_evacuation"): ("evacuated_by",),
+        ("work_permit", "close"): ("reason",),
     }
     CREATE_ROLES = {
         "equipment": ("admin", "inspector"),
         "inspection": ("admin", "inspector"),
         "maintenance": ("admin", "maintenance"),
-        "alarm": ("admin", "dispatcher", "inspector"),
+        "alarm": ("admin", "dispatcher", "inspector", "maintenance"),
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
+        "shaft": ("admin", "inspector", "dispatcher"),
+        "work_permit": ("admin", "maintenance", "inspector"),
     }
     ROLE_ACTIONS = {
         "suspend": ("admin", "inspector"),
@@ -212,10 +333,14 @@ class RuleEngine:
         "reschedule": ("admin", "inspector"),
         "start": ("admin", "maintenance"),
         "complete": ("admin", "maintenance", "dispatcher"),
+        "confirm_evacuation": ("admin", "maintenance"),
+        "mark_review": ("admin", "maintenance", "dispatcher", "inspector"),
+        "review_evacuated": ("admin", "dispatcher", "inspector"),
+        "review_resume": ("admin", "dispatcher", "inspector", "maintenance"),
         "dispatch": ("admin", "dispatcher"),
         "mark_false": ("admin", "dispatcher", "inspector"),
         "resolve": ("admin", "dispatcher"),
-        "close": ("admin", "dispatcher", "inspector"),
+        "close": ("admin", "dispatcher", "inspector", "maintenance"),
         "arrive": ("admin", "dispatcher"),
         "abort": ("admin", "dispatcher"),
         "submit_evidence": ("admin", "maintenance", "inspector"),
@@ -225,6 +350,9 @@ class RuleEngine:
         "grant": ("admin", "inspector"),
         "revoke": ("admin", "inspector"),
         "expire": ("admin", "inspector"),
+        "issue": ("admin", "dispatcher", "inspector"),
+        "activate": ("admin", "maintenance"),
+        "void": ("admin", "dispatcher", "inspector"),
     }
     CUSTOM_CREATE = {
         "equipment": lambda a, d, l: _validate_equipment(d, l),
@@ -234,11 +362,17 @@ class RuleEngine:
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
         "remediation": lambda a, d, l: _validate_remediation(d, l),
         "permit": lambda a, d, l: _validate_permit(d, l),
+        "shaft": lambda a, d, l: _validate_shaft(d, l),
+        "work_permit": lambda a, d, l: _validate_work_permit(d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("work_permit", "issue"): _issue_work_permit,
+        ("work_permit", "activate"): _activate_work_permit,
+        ("maintenance", "start"): _start_maintenance,
+        ("maintenance", "review_resume"): _resume_maintenance,
     }
 
     def normalize_kind(self, kind):

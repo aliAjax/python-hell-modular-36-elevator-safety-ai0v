@@ -21,10 +21,18 @@ def main(argv=None):
     static_dir = Path(__file__).resolve().parent / "static"
     server = create_server(args.host, args.port, service, rules, str(static_dir))
 
+    recovered = service.retry_pending()
+    if recovered:
+        print("recovered unfinished operations: %s" % ",".join(recovered), flush=True)
+
     def stop(signum, frame):
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, stop)
+    try:
+        signal.signal(signal.SIGTERM, stop)
+    except ValueError:
+        # 非主线程（例如嵌入式启动）无法注册信号
+        pass
     try:
         print("电梯与自动扶梯巡检和事件响应 listening on http://%s:%s" % (args.host, args.port), flush=True)
         server.serve_forever()

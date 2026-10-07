@@ -84,6 +84,18 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "operations"]:
+                    query = parse_qs(parsed.query)
+                    status = query.get("status", [None])[0]
+                    return self._send(200, {"items": service.list_operations(status=status)})
+                if len(parts) == 4 and parts[:2] == ["api", "operations"] and parts[3] == "retry":
+                    return self._send(200, service.retry_operation(parts[2]))
+                if len(parts) == 3 and parts[:2] == ["api", "operations"]:
+                    return self._send(200, service.get_operation(parts[2]))
+                if parts == ["api", "offline-shifts"]:
+                    return self._send(200, {"items": service.offline_shifts()})
+                if len(parts) == 4 and parts[:2] == ["api", "shafts"] and parts[3] == "account":
+                    return self._send(200, service.shaft_account(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
@@ -104,6 +116,19 @@ def create_handler(service, rules, static_dir):
                 if parts == ["api", "offline-records"]:
                     body = self._body()
                     return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
+                if parts == ["api", "operations"]:
+                    body = self._body()
+                    op_type = body.get("op_type") or body.get("type")
+                    if not op_type:
+                        raise ValidationError("op_type is required")
+                    payload = body.get("payload", body)
+                    op_id = body.get("operation_id")
+                    idem = self.headers.get("Idempotency-Key")
+                    snapshot = service.submit_operation(actor, op_type, payload, op_id, idem)
+                    status = 200 if snapshot["status"] == "completed" else 202
+                    return self._send(status, snapshot)
+                if len(parts) == 4 and parts[:2] == ["api", "operations"] and parts[3] == "retry":
+                    return self._send(200, service.retry_operation(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
