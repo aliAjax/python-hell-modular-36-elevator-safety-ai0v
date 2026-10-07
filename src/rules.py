@@ -64,15 +64,21 @@ def _validate_maintenance(data, lookup):
 
 
 def _validate_alarm(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
+    equipment_id = data.get("equipment_id")
+    hoistway_id = data.get("hoistway_id")
+    if not equipment_id and not hoistway_id:
+        raise ValidationError("alarm requires equipment_id or hoistway_id")
+    if equipment_id and not _find_one(lookup, "equipment", "id", equipment_id):
         raise ValidationError("alarm requires equipment")
+    if hoistway_id and not _find_one(lookup, "hoistway", "id", hoistway_id):
+        raise ValidationError("alarm requires hoistway")
     for alarm in _all(lookup, "alarm"):
-        if (
-            alarm["data"].get("equipment_id") == data.get("equipment_id")
-            and alarm["data"].get("code") == data.get("code")
-            and alarm["status"] not in ("closed", "false_alarm")
-        ):
+        if alarm["status"] in ("closed", "false_alarm"):
+            continue
+        if equipment_id and alarm["data"].get("equipment_id") == equipment_id and alarm["data"].get("code") == data.get("code"):
             raise ConflictError("active alarm already exists for equipment and code")
+        if hoistway_id and alarm["data"].get("hoistway_id") == hoistway_id and alarm["data"].get("code") == data.get("code"):
+            raise ConflictError("active alarm already exists for hoistway and code")
 
 
 def _validate_rescue(data, lookup):
@@ -113,6 +119,49 @@ def _grant_permit(actor, entity, data, lookup):
     return {"granted_by": actor.user_id, "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
 
 
+def _validate_hoistway(data, lookup):
+    name = str(data.get("name", "")).strip()
+    if not name:
+        raise ValidationError("name is required")
+    for hoistway in _all(lookup, "hoistway"):
+        if str(hoistway["data"].get("name", "")).strip() == name:
+            raise ConflictError("hoistway name already exists: " + name)
+    equipment_id = data.get("equipment_id")
+    if equipment_id and not _find_one(lookup, "equipment", "id", equipment_id):
+        raise ValidationError("hoistway references unknown equipment")
+
+
+def _validate_entry_permit(data, lookup):
+    if not _find_one(lookup, "hoistway", "id", data.get("hoistway_id")):
+        raise ValidationError("entry_permit requires hoistway")
+    if data.get("purpose") not in ("maintenance", "repair", "inspection", "rescue", "modernization"):
+        raise ValidationError("invalid entry_permit purpose")
+    for permit in _all(lookup, "entry_permit"):
+        if permit["data"].get("hoistway_id") == data.get("hoistway_id") and permit["status"] == "active":
+            raise ConflictError("active entry permit already exists for hoistway")
+
+
+def _grant_entry_permit(actor, entity, data, lookup):
+    hoistway = _find_one(lookup, "hoistway", "id", entity["data"].get("hoistway_id"))
+    if not hoistway:
+        raise ConflictError("entry_permit requires hoistway")
+    if hoistway["status"] != "free":
+        raise ConflictError("hoistway is not free (status: %s)" % hoistway["status"])
+    return {"granted_by": actor.user_id, "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+
+
+def _confirm_evacuation(actor, entity, data, lookup):
+    return {
+        "evacuated": True,
+        "evacuated_by": actor.user_id,
+        "evacuated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+
+def _validate_offline_record(data, lookup):
+    return None
+
+
 def _verify_remediation(actor, entity, data, lookup):
     if not entity["data"].get("evidence"):
         raise ValidationError("remediation evidence is required before verification")
@@ -130,12 +179,14 @@ class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "hoistways": "hoistway", "entry_permits": "entry_permit",
+        "offline_records": "offline_record",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "hoistway": "free", "entry_permit": "requested",
+        "offline_record": "pending",
     }
     TRANSITIONS = {
         "equipment": {
@@ -151,6 +202,9 @@ class RuleEngine:
         "maintenance": {
             "start": (("planned",), "in_progress"),
             "complete": (("in_progress",), "completed"),
+            "confirm_evacuation": (("in_progress", "pending_review"), "in_progress"),
+            "mark_pending_review": (("in_progress",), "pending_review"),
+            "resume": (("pending_review",), "in_progress"),
         },
         "alarm": {
             "dispatch": (("received",), "dispatched"),
@@ -175,6 +229,18 @@ class RuleEngine:
             "revoke": (("granted", "pending_review"), "revoked"),
             "expire": (("granted",), "expired"),
         },
+        "hoistway": {
+            "occupy": (("free",), "occupied"),
+            "alarm": (("free", "occupied"), "alarm"),
+            "release": (("occupied", "alarm"), "free"),
+            "reset": (("alarm",), "free"),
+        },
+        "entry_permit": {
+            "grant": (("requested",), "active"),
+            "evacuate": (("active",), "evacuated"),
+            "invalidate": (("requested", "active"), "invalidated"),
+            "expire": (("active",), "expired"),
+        },
     }
     CREATE_REQUIRED = {
         "equipment": ("asset_no", "equipment_type", "location", "inspection_interval_days"),
@@ -184,6 +250,9 @@ class RuleEngine:
         "rescue_job": ("alarm_id", "dedupe_key", "team"),
         "remediation": ("issue", "owner", "due_at"),
         "permit": ("equipment_id", "purpose", "requested_by"),
+        "hoistway": ("name",),
+        "entry_permit": ("hoistway_id", "team", "purpose"),
+        "offline_record": (),
     }
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
@@ -202,6 +271,9 @@ class RuleEngine:
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
+        "hoistway": ("admin", "inspector"),
+        "entry_permit": ("admin", "inspector", "maintenance"),
+        "offline_record": ("admin", "inspector", "dispatcher", "maintenance"),
     }
     ROLE_ACTIONS = {
         "suspend": ("admin", "inspector"),
@@ -225,6 +297,15 @@ class RuleEngine:
         "grant": ("admin", "inspector"),
         "revoke": ("admin", "inspector"),
         "expire": ("admin", "inspector"),
+        "occupy": ("admin", "inspector", "dispatcher"),
+        "alarm": ("admin", "dispatcher", "inspector"),
+        "release": ("admin", "inspector", "dispatcher"),
+        "reset": ("admin", "inspector"),
+        "evacuate": ("admin", "maintenance", "dispatcher"),
+        "invalidate": ("admin", "dispatcher", "inspector"),
+        "confirm_evacuation": ("admin", "maintenance", "dispatcher"),
+        "mark_pending_review": ("admin", "dispatcher", "inspector"),
+        "resume": ("admin", "maintenance", "inspector"),
     }
     CUSTOM_CREATE = {
         "equipment": lambda a, d, l: _validate_equipment(d, l),
@@ -234,11 +315,16 @@ class RuleEngine:
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
         "remediation": lambda a, d, l: _validate_remediation(d, l),
         "permit": lambda a, d, l: _validate_permit(d, l),
+        "hoistway": lambda a, d, l: _validate_hoistway(d, l),
+        "entry_permit": lambda a, d, l: _validate_entry_permit(d, l),
+        "offline_record": lambda a, d, l: _validate_offline_record(d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("entry_permit", "grant"): _grant_entry_permit,
+        ("maintenance", "confirm_evacuation"): _confirm_evacuation,
     }
 
     def normalize_kind(self, kind):

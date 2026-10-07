@@ -84,6 +84,10 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "hoistways" and parts[3] == "occupancy":
+                    return self._send(200, service.occupancy_ledger(parts[2]))
+                if parts == ["api", "offline", "gaps"]:
+                    return self._send(200, service.offline_gaps())
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
@@ -103,7 +107,22 @@ def create_handler(service, rules, static_dir):
                 actor = self._actor()
                 if parts == ["api", "offline-records"]:
                     body = self._body()
-                    return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
+                    return self._send(200, service.merge_offline(actor, body.get("records", [])))
+                if parts == ["api", "recover"]:
+                    return self._send(200, service.recover(actor))
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "hoistways":
+                    body = self._body()
+                    if parts[3] == "issue-permit":
+                        return self._send(200, service.issue_entry_permit(
+                            actor, parts[2], body.get("team"), body.get("purpose"),
+                            body.get("shift"), body.get("seq"),
+                        ))
+                    if parts[3] == "report-alarm":
+                        return self._send(200, service.report_alarm(
+                            actor, parts[2], body.get("code"), body.get("occurred_at"), body.get("team"),
+                        ))
+                    if parts[3] == "release":
+                        return self._send(200, service.release_hoistway(actor, parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

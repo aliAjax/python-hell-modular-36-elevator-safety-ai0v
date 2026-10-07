@@ -7,5 +7,13 @@
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre></main>
+POST /api/entities/&lt;id&gt;/actions
+POST /api/hoistways
+POST /api/hoistways/&lt;id&gt;/issue-permit
+POST /api/hoistways/&lt;id&gt;/report-alarm
+POST /api/hoistways/&lt;id&gt;/release
+GET  /api/hoistways/&lt;id&gt;/occupancy
+POST /api/offline-records
+GET  /api/offline/gaps
+POST /api/recover</pre></main>
 <script>async function checkHealth(){const r=await fetch('/health');document.getElementById('result').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
